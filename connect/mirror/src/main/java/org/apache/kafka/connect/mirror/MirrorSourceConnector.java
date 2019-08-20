@@ -179,7 +179,14 @@ public class MirrorSourceConnector extends SourceConnector {
             log.info("Found {} topic-partitions on {}. {} are new. {} were removed. Previously had {}.",
                     topicPartitions.size(), sourceAndTarget.source(), newTopicPartitions.size(), 
                     deadTopicPartitions.size(), knownTopicPartitions.size());
+
+            // Create new topics or partitions
+            createNewTopicOrPartitions(topicPartitions.stream().collect(Collectors.toList()));
+
+            // TODO: Delete dead topics (removing partitions isn't possible). should probably config guard this?
+
             knownTopicPartitions = topicPartitions;
+            knownTargetTopics = findExistingTargetTopics();
             context.requestTaskReconfiguration();
         } else {
             knownTargetTopics = findExistingTargetTopics();
@@ -233,16 +240,29 @@ public class MirrorSourceConnector extends SourceConnector {
 
     private void createTopicPartitions()
             throws InterruptedException, ExecutionException {
-        Map<String, Long> partitionCounts = knownTopicPartitions.stream()
-            .collect(Collectors.groupingBy(x -> x.topic(), Collectors.counting())).entrySet().stream()
-            .collect(Collectors.toMap(x -> formatRemoteTopic(x.getKey()), x -> x.getValue()));
+        createNewTopicOrPartitions(knownTopicPartitions);
+    }
+
+    private void createNewTopicOrPartitions(List<TopicPartition> desiredPartitions)
+            throws InterruptedException, ExecutionException {
+
+        Map<String, Long> knownPartitionCounts = knownTopicPartitions.stream()
+                .collect(Collectors.groupingBy(x -> x.topic(), Collectors.counting())).entrySet().stream()
+                .collect(Collectors.toMap(x -> formatRemoteTopic(x.getKey()), x -> x.getValue()));
+        Map<String, Long> partitionCounts = desiredPartitions.stream()
+                .collect(Collectors.groupingBy(x -> x.topic(), Collectors.counting())).entrySet().stream()
+                .collect(Collectors.toMap(x -> formatRemoteTopic(x.getKey()), x -> x.getValue()));
         List<NewTopic> newTopics = partitionCounts.entrySet().stream()
-            .filter(x -> !knownTargetTopics.contains(x.getKey()))
-            .map(x -> new NewTopic(x.getKey(), x.getValue().intValue(), (short) replicationFactor))
-            .collect(Collectors.toList());
+                .filter(x -> !knownTargetTopics.contains(x.getKey()))
+                .map(x -> new NewTopic(x.getKey(), x.getValue().intValue(), (short) replicationFactor))
+                .collect(Collectors.toList());
         Map<String, NewPartitions> newPartitions = partitionCounts.entrySet().stream()
-            .filter(x -> knownTargetTopics.contains(x.getKey()))
-            .collect(Collectors.toMap(x -> x.getKey(), x -> NewPartitions.increaseTo(x.getValue().intValue())));
+                .filter(x -> // Only select new partitions for topics that are known and have actually increased in size
+                        knownTargetTopics.contains(x.getKey()) &&
+                        (!knownPartitionCounts.containsKey(x.getKey()) || knownPartitionCounts.get(x.getKey()) < x.getValue().intValue())
+                )
+                .collect(Collectors.toMap(x -> x.getKey(), x -> NewPartitions.increaseTo(x.getValue().intValue())));
+
         synchronized (this) {
             targetAdminClient.createTopics(newTopics, new CreateTopicsOptions()).values().forEach((k, v) -> v.whenComplete((x, e) -> {
                 if (e != null) {
